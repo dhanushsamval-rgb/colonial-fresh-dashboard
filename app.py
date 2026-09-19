@@ -91,10 +91,13 @@ focus_store = st.sidebar.selectbox(
     STORES,
     index=0
 )
-)
+
 focus_product_label = st.sidebar.selectbox(
-    "Focus product", PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"], index=0
+    "Focus product",
+    PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"],
+    index=0
 )
+
 focus_product_id = focus_product_label.split(" – ")[0]
 focus_product_name = PRODUCTS.loc[PRODUCTS["Product_ID"] == focus_product_id, "Product_Name"].iloc[0]
 
