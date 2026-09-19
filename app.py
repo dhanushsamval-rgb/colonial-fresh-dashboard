@@ -12,6 +12,7 @@ Colonial Fresh system. No business-improvement results are claimed - only
 the mechanics of the proposed decision-support logic are demonstrated.
 """
 
+import time
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -29,6 +30,7 @@ from inventory_analysis import (
     build_risk_table,
     RECENT_WINDOW_DAYS,
 )
+import simulation
 
 st.set_page_config(page_title="Colonial Fresh | Demand & Inventory Prototype", layout="wide")
 
@@ -98,11 +100,12 @@ products_selected_df = PRODUCTS[PRODUCTS["Product_ID"].isin(product_ids_selected
 # Tabs
 # ---------------------------------------------------------------------------
 tab_overview, tab_movement, tab_forecast, tab_inventory, tab_leadtime, \
-    tab_expiry, tab_reorder, tab_risk, tab_architecture = st.tabs(
+    tab_expiry, tab_reorder, tab_risk, tab_live, tab_architecture = st.tabs(
         [
             "1️⃣ Overview", "2️⃣ Movement Analysis", "3️⃣ Demand Forecasting",
             "4️⃣ Inventory Monitoring", "5️⃣ Lead-Time Tracking", "6️⃣ Expiry Tracking",
-            "7️⃣ Reorder Recommendation", "8️⃣ Risk Dashboard", "9️⃣ Solution Architecture",
+            "7️⃣ Reorder Recommendation", "8️⃣ Risk Dashboard", "🔴 Live Simulation",
+            "9️⃣ Solution Architecture",
         ]
     )
 
@@ -412,7 +415,7 @@ with tab_risk:
         return colors.get(val, "")
 
     st.dataframe(
-        display_df.style.applymap(_risk_color, subset=["Risk"]),
+        display_df.style.map(_risk_color, subset=["Risk"]),
         use_container_width=True, hide_index=True,
     )
 
@@ -430,7 +433,145 @@ with tab_risk:
         st.plotly_chart(fig, use_container_width=True)
 
 # ===========================================================================
-# TAB 9: SOLUTION ARCHITECTURE (Sprint 2 design explanation)
+# TAB: LIVE SIMULATION (full network — all 6 stores x 3 SKUs)
+# ===========================================================================
+with tab_live:
+    st.subheader("Live Simulation — Full Store Network")
+    st.info(
+        "This simulates ongoing daily grocery operations **forward** from the end of the "
+        "real historical dataset (i.e. from " + str(AS_OF_DATE.date()) + " onward). Each simulated "
+        "day's demand is synthetically generated from patterns learned from the real 2024-2025 "
+        "history for each Store+SKU (recent average daily sales, day-of-week seasonality, "
+        "promotion effect size) plus random day-to-day variation — **it is not real sales data**. "
+        "The same 7-day moving-average forecast, lead-time-aware reorder formula and risk "
+        "classification used elsewhere in this app run automatically every simulated day, so you "
+        "can watch demand-based reordering actually trigger and restocks actually arrive.",
+        icon="🔴",
+    )
+
+    if "sim_state" not in st.session_state:
+        st.session_state.sim_state = simulation.init_simulation_state(df, STORES, PRODUCTS, AS_OF_DATE, seed=None)
+    if "sim_autoplay" not in st.session_state:
+        st.session_state.sim_autoplay = False
+    if "sim_speed" not in st.session_state:
+        st.session_state.sim_speed = 1.5
+
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1.4, 1])
+    with ctrl1:
+        next_day_clicked = st.button("▶ Next Day", use_container_width=True)
+    with ctrl2:
+        reset_clicked = st.button("🔁 Reset Simulation", use_container_width=True)
+    with ctrl3:
+        st.session_state.sim_speed = st.slider("Auto-play speed (seconds/day)", 0.3, 4.0, st.session_state.sim_speed, 0.1)
+    with ctrl4:
+        st.session_state.sim_autoplay = st.toggle("Auto-play", value=st.session_state.sim_autoplay)
+
+    if reset_clicked:
+        st.session_state.sim_state = simulation.init_simulation_state(df, STORES, PRODUCTS, AS_OF_DATE, seed=None)
+        st.session_state.sim_autoplay = False
+        st.rerun()
+
+    if next_day_clicked:
+        st.session_state.sim_state = simulation.simulate_next_day(st.session_state.sim_state)
+
+    sim_state = st.session_state.sim_state
+    sim_log = sim_state["log"]
+
+    st.markdown(f"**Simulated date:** {sim_state['sim_date'].date()}  ·  "
+                f"**Days simulated:** {sim_state['days_simulated']}")
+
+    if sim_log.empty:
+        st.warning("No simulated days yet — click **Next Day** or turn on **Auto-play** to begin.")
+    else:
+        latest_date = sim_log["Date"].max()
+        today_log = sim_log[sim_log["Date"] == latest_date]
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Network Stock (units)", f"{today_log['Closing_Stock'].sum():,.0f}")
+        k2.metric("Units Sold Today", f"{today_log['Units_Sold'].sum():,.0f}")
+        k3.metric("Wastage Today", f"{today_log['Wastage'].sum():,.0f}")
+        k4.metric("Orders Placed Today", f"{(today_log['Recommended_Order'] > 0).sum()} combos")
+        k5.metric("Units Reordered Today", f"{today_log['Recommended_Order'].sum():,.0f}")
+
+        st.divider()
+        st.markdown("**Today's snapshot — all stores × SKUs**")
+
+        def _risk_color_live(val):
+            colors = {"Normal": "background-color:#e6f4ea", "Stockout Risk": "background-color:#fce8e6",
+                      "Overstock Risk": "background-color:#fef3e2", "Expiry Risk": "background-color:#f3e8fd"}
+            return colors.get(val, "")
+
+        show_cols = ["Store", "Product_Name", "Opening_Stock", "Incoming_Stock", "Units_Sold",
+                     "Closing_Stock", "Wastage", "Stockout", "Recommended_Order", "Risk"]
+        st.dataframe(
+            today_log[show_cols].rename(columns={"Product_Name": "Product"}).style.map(_risk_color_live, subset=["Risk"]),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.caption(
+            "**Reading this table:** 'Risk' is a leading, forward-looking flag based on whether "
+            "on-hand + already-ordered stock covers a full lead-time cycle under the 20% safety-stock "
+            "policy. 'Stockout' shows whether that SPECIFIC day's actual demand was fully met. With a "
+            "lean 20% safety margin and short 1-2 day lead times, 'Stockout Risk' can flag often as an "
+            "early warning even while actual demand keeps getting met most days — the two metrics below "
+            "make that gap visible, which is a genuine discussion point for Sprint 3 (e.g. would a higher "
+            "safety-stock % reduce false-positive risk flags at the cost of holding more stock?)."
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            actual_stockout_rate = (sim_log["Stockout"] == "Yes").mean()
+            st.metric("Actual demand-unmet rate (measured, all days simulated)", f"{actual_stockout_rate:.1%}")
+        with c2:
+            risk_flag_rate = (sim_log["Risk"] != "Normal").mean()
+            st.metric("Risk-flag rate (leading indicator, all days simulated)", f"{risk_flag_rate:.1%}")
+
+        st.divider()
+        st.markdown("**Network trends across the simulation**")
+        network_daily = sim_log.groupby("Date").agg(
+            Total_Units_Sold=("Units_Sold", "sum"),
+            Total_Forecast=("Avg_Daily_Forecast", "sum"),
+            Total_Closing_Stock=("Closing_Stock", "sum"),
+            Total_Wastage=("Wastage", "sum"),
+        ).reset_index()
+
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=network_daily["Date"], y=network_daily["Total_Units_Sold"],
+                                   name="Actual Units Sold (network)", line=dict(color="#1f77b4")))
+        fig1.add_trace(go.Scatter(x=network_daily["Date"], y=network_daily["Total_Forecast"],
+                                   name="Forecast (sum of daily rates, network)", line=dict(color="#2ca02c", dash="dash")))
+        fig1.update_layout(title="Network-Wide Actual Demand vs Forecast (simulated days)",
+                           xaxis_title="Date", yaxis_title="Units")
+        st.plotly_chart(fig1, use_container_width=True)
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=network_daily["Date"], y=network_daily["Total_Closing_Stock"],
+                                   name="Total Network Closing Stock", line=dict(color="#1f77b4")))
+        fig2.update_layout(title="Total Network Stock On Hand Over Time", xaxis_title="Date", yaxis_title="Units")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        st.markdown(f"**Drill-down: {focus_product_name} @ {focus_store}** (using the focus selectors in the sidebar)")
+        combo_log = sim_log[(sim_log["Store"] == focus_store) & (sim_log["Product_ID"] == focus_product_id)]
+        if combo_log.empty:
+            st.caption("No simulated days yet for this store/SKU.")
+        else:
+            fig3 = go.Figure()
+            fig3.add_trace(go.Scatter(x=combo_log["Date"], y=combo_log["Closing_Stock"], name="Closing Stock", line=dict(color="#1f77b4")))
+            fig3.add_trace(go.Bar(x=combo_log["Date"], y=combo_log["Recommended_Order"], name="Order Placed", marker_color="#ff7f0e", opacity=0.6, yaxis="y2"))
+            fig3.update_layout(
+                yaxis=dict(title="Closing Stock"),
+                yaxis2=dict(title="Order Placed", overlaying="y", side="right"),
+                title=f"{focus_product_name} @ {focus_store}: Stock Level & Reorders (simulated)",
+            )
+            st.plotly_chart(fig3, use_container_width=True)
+
+    if st.session_state.sim_autoplay:
+        time.sleep(st.session_state.sim_speed)
+        st.session_state.sim_state = simulation.simulate_next_day(st.session_state.sim_state)
+        st.rerun()
+
+# ===========================================================================
+# TAB: SOLUTION ARCHITECTURE (Sprint 2 design explanation)
 # ===========================================================================
 with tab_architecture:
     st.subheader("Solution Architecture — Sprint 2 Design")

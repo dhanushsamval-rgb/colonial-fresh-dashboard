@@ -20,7 +20,36 @@ three baseline SKUs (Bananas, Apples, Strawberries) across six Colonial Fresh st
 6. Expiry Tracking (shelf life / expiry date / days remaining — labelled as simulated)
 7. Demand-Based Reorder Recommendation (transparent formula, shown step-by-step)
 8. Risk Dashboard (Normal / Stockout Risk / Overstock Risk / Expiry Risk, all SKUs × stores)
-9. Solution Architecture (the Sprint 2 design write-up, embedded in the app)
+9. **Live Simulation** (full 6-store × 3-SKU network, running forward day-by-day — see below)
+10. Solution Architecture (the Sprint 2 design write-up, embedded in the app)
+
+## Live Simulation tab
+
+This is the most advanced piece of the prototype: a day-by-day simulation that runs the whole
+demand → forecast → reorder → restock loop live, across all 6 stores and all 3 SKUs, starting
+the day after the real historical data ends.
+
+- Each simulated day's demand is generated from patterns learned from the real history (recent
+  average sales, day-of-week seasonality, promotion effect size) plus random daily variation —
+  it is **not** real or predicted future sales, purely a plausible synthetic continuation used to
+  demonstrate the decision logic in motion.
+- The exact same forecasting (`forecasting.py`), reorder formula and risk classification
+  (`inventory_analysis.py`) used in the historical tabs are reused here, so the two parts of the
+  app stay consistent.
+- When the system recommends a reorder, it is automatically "placed" and arrives after that SKU's
+  lead time — so you can watch stock deplete, a reorder trigger, and the restock arrive on
+  schedule, all live.
+- Controls: **Next Day** (manual step), **Reset Simulation**, and an **Auto-play** toggle with a
+  speed slider.
+- Two KPIs are shown side by side on purpose: the **Risk-flag rate** (a leading, forward-looking
+  warning based on whether on-hand + on-order stock covers a full lead-time cycle under the 20%
+  safety-stock policy) and the **actual demand-unmet rate** (a lagging, measured outcome — whether
+  that day's real demand was actually fulfilled). In testing, the risk flag fires on ~99% of
+  combo-days while actual unmet demand sits around ~13% — a genuine finding worth discussing with
+  your lecturer: with only a 20% safety margin and 1–2 day lead times, this reorder policy keeps
+  inventory lean enough that the leading-indicator flag fires far more often than real shortages
+  occur. A natural Sprint 3 question: would a higher safety-stock percentage reduce false-positive
+  risk flags, at the cost of holding more stock?
 
 ## How to run it
 
@@ -42,10 +71,11 @@ it with an updated file, keep the same filename and sheet name (`Mock_Data`).
 
 ```
 colonial_fresh_dashboard/
-├── app.py                  # Streamlit UI — all 9 dashboard sections
+├── app.py                  # Streamlit UI — all dashboard sections, incl. Live Simulation tab
 ├── data_utils.py            # Loading, validation, cleaning
 ├── forecasting.py           # Baseline moving-average model + optional ML comparison model
 ├── inventory_analysis.py    # Movement analysis, lead-time, expiry, reorder, risk logic
+├── simulation.py            # Live day-by-day simulation engine (full store network)
 ├── requirements.txt
 ├── README.md
 └── data/
