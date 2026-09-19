@@ -99,8 +99,15 @@ focus_product_label = st.sidebar.selectbox(
 
 )
 
-focus_product_id = focus_product_label.split(" – ")[0]
-focus_product_name = PRODUCTS.loc[PRODUCTS["Product_ID"] == focus_product_id, "Product_Name"].iloc[0]
+if focus_product_label == "All Products":
+    focus_product_id = None
+    focus_product_name = "All Products"
+else:
+    focus_product_id = focus_product_label.split(" - ")[0]
+    focus_product_name = PRODUCTS.loc[
+        PRODUCTS["Product_ID"] == focus_product_id,
+        "Product_Name"
+    ].iloc[0]
 
 filtered_df = filter_data(df, stores_selected, product_ids_selected)
 products_selected_df = PRODUCTS[PRODUCTS["Product_ID"].isin(product_ids_selected)].reset_index(drop=True)
