@@ -88,16 +88,15 @@ st.sidebar.divider()
 st.sidebar.caption("Detailed single-SKU sections (Forecasting, Inventory, Lead-Time, Expiry, Reorder) use the focus selectors below:")
 focus_store = st.sidebar.selectbox(
     "Focus store",
-    ["All Stores"] + STORES,
+    STORES,
     index=0
 )
 
 focus_product_label = st.sidebar.selectbox(
     "Focus product",
-    ["All Products"] + list(
-        PRODUCTS["Product_ID"] + " - " + PRODUCTS["Product_Name"]
-    ),
+    PRODUCTS["Product_ID"] + " - " + PRODUCTS["Product_Name"],
     index=0
+
 )
 
 focus_product_id = focus_product_label.split(" – ")[0]
