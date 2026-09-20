@@ -164,6 +164,70 @@ def classify_risk(
     return "Normal"
 
 
+def build_full_snapshot_table(
+    df: pd.DataFrame, stores: list, products: pd.DataFrame, as_of_date: pd.Timestamp, forecast_days: int
+) -> pd.DataFrame:
+    """
+    Build ONE comprehensive table covering every Store x SKU combination, with every
+    figure needed across the Forecasting / Inventory / Lead-Time / Expiry / Reorder
+    views: today's Opening/Incoming/Sold/Closing/Wastage/Stockout, the forecast, the
+    full lead-time + safety-stock + reorder calculation breakdown, and expiry info.
+
+    This exists so the dashboard can show "everything, all stores, all SKUs" at once
+    (no manual filtering needed) without duplicating the underlying business logic -
+    it reuses the exact same functions as the rest of the app.
+    """
+    rows = []
+    for store in stores:
+        for _, prod in products.iterrows():
+            product_id = prod["Product_ID"]
+
+            snap = current_snapshot(df, store, product_id, as_of_date)
+            fc = baseline_moving_average_forecast(df, store, product_id, as_of_date, forecast_days)
+            avg_daily = fc["avg_daily_rate"]
+
+            lt = lead_time_metrics(df, store, product_id, as_of_date, avg_daily)
+            exp = expiry_metrics(df, store, product_id, as_of_date)
+            reorder = calculate_reorder(
+                lt["Forecasted_Demand_During_Lead_Time"], lt["Current_Stock"], lt["Incoming_Stock_Estimate"]
+            )
+            risk = classify_risk(
+                lt["Current_Stock"], lt["Forecasted_Demand_During_Lead_Time"], exp.get("Days_Remaining", 999)
+            )
+
+            rows.append({
+                "Store": store,
+                "SKU": product_id,
+                "Product": prod["Product_Name"],
+                "Movement": prod["Movement_Class"],
+                # Today's inventory snapshot
+                "Opening_Stock": snap.get("Opening_Stock"),
+                "Incoming_Stock_Today": snap.get("Incoming_Stock"),
+                "Units_Sold_Today": snap.get("Units_Sold"),
+                "Current_Stock": lt["Current_Stock"],  # = today's Closing_Stock
+                "Wastage_Today": snap.get("Wastage"),
+                "Stockout_Today": snap.get("Stockout"),
+                # Forecast
+                "Avg_Daily_Forecast": round(avg_daily, 2),
+                "Forecast_Period_Demand": round(avg_daily * forecast_days, 1),
+                # Lead time
+                "Lead_Time_Days": lt["Lead_Time_Days"],
+                "Forecast_During_Lead_Time": round(lt["Forecasted_Demand_During_Lead_Time"], 1),
+                "Incoming_Stock_Estimate": round(lt["Incoming_Stock_Estimate"], 1),
+                # Reorder calculation (full breakdown)
+                "Safety_Stock": round(reorder["Safety_Stock"], 1),
+                "Raw_Calculation": round(reorder["Raw_Calculation"], 1),
+                "Recommended_Order": reorder["Recommended_Order"],
+                # Expiry
+                "Shelf_Life_Days": exp.get("Shelf_Life_Days"),
+                "Expiry_Date": exp.get("Expiry_Date").date() if exp.get("Expiry_Date") is not None else None,
+                "Days_To_Expiry": exp.get("Days_Remaining"),
+                # Risk
+                "Risk": risk,
+            })
+    return pd.DataFrame(rows)
+
+
 def build_risk_table(
     df: pd.DataFrame, stores: list, products: pd.DataFrame, as_of_date: pd.Timestamp, forecast_days: int
 ) -> pd.DataFrame:

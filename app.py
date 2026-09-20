@@ -18,16 +18,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_utils import load_and_prepare, get_stores, get_products, get_as_of_date, filter_data
+from data_utils import load_and_prepare, get_stores, get_products, get_as_of_date
 from forecasting import baseline_moving_average_forecast, linear_trend_forecast
 from inventory_analysis import (
     movement_analysis,
-    current_snapshot,
-    lead_time_metrics,
-    expiry_metrics,
-    calculate_reorder,
-    classify_risk,
     build_risk_table,
+    build_full_snapshot_table,
     RECENT_WINDOW_DAYS,
 )
 import simulation
@@ -70,47 +66,19 @@ if load_messages:
             st.write("•", m)
 
 # ---------------------------------------------------------------------------
-# Sidebar filters
+# Scope: this dashboard always shows ALL stores and ALL SKUs together (no
+# filtering), so it can be presented end-to-end without pausing to change
+# dropdowns. The only control is the forecast horizon, since that's a genuine
+# "what-if" parameter rather than something that hides data.
 # ---------------------------------------------------------------------------
-st.sidebar.header("Filters")
-
-store_filter = st.sidebar.multiselect("Store", STORES, default=STORES)
-product_filter = st.sidebar.multiselect(
-    "Product", PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"],
-    default=list(PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"]),
-)
-product_ids_selected = [p.split(" – ")[0] for p in product_filter] or PRODUCTS["Product_ID"].tolist()
-stores_selected = store_filter or STORES
-
+st.sidebar.header("Settings")
 forecast_period = st.sidebar.selectbox("Forecast period (days)", [7, 14, 30], index=0)
+st.sidebar.caption("Every tab below always shows **all 6 stores × all 3 SKUs** together — nothing is filtered or hidden.")
 
-st.sidebar.divider()
-st.sidebar.caption("Detailed single-SKU sections (Forecasting, Inventory, Lead-Time, Expiry, Reorder) use the focus selectors below:")
-focus_store = st.sidebar.selectbox(
-    "Focus store",
-    STORES,
-    index=0
-)
-
-focus_product_label = st.sidebar.selectbox(
-    "Focus product",
-    PRODUCTS["Product_ID"] + " - " + PRODUCTS["Product_Name"],
-    index=0
-
-)
-
-if focus_product_label == "All Products":
-    focus_product_id = None
-    focus_product_name = "All Products"
-else:
-    focus_product_id = focus_product_label.split(" - ")[0]
-    focus_product_name = PRODUCTS.loc[
-        PRODUCTS["Product_ID"] == focus_product_id,
-        "Product_Name"
-    ].iloc[0]
-
-filtered_df = filter_data(df, stores_selected, product_ids_selected)
-products_selected_df = PRODUCTS[PRODUCTS["Product_ID"].isin(product_ids_selected)].reset_index(drop=True)
+stores_selected = STORES
+product_ids_selected = PRODUCTS["Product_ID"].tolist()
+filtered_df = df
+products_selected_df = PRODUCTS
 
 # ---------------------------------------------------------------------------
 # Tabs
@@ -125,16 +93,22 @@ tab_overview, tab_movement, tab_forecast, tab_inventory, tab_leadtime, \
         ]
     )
 
-# Pre-compute the risk table once (used by Overview and Risk Dashboard tabs)
+# Pre-compute the risk table and the full all-store x all-SKU snapshot once (reused across tabs)
 risk_table = build_risk_table(df, stores_selected, products_selected_df, AS_OF_DATE, forecast_period)
+full_table = build_full_snapshot_table(df, STORES, PRODUCTS, AS_OF_DATE, forecast_period)
+
+
+def _risk_style(val):
+    colors = {"Normal": "background-color:#e6f4ea", "Stockout Risk": "background-color:#fce8e6",
+              "Overstock Risk": "background-color:#fef3e2", "Expiry Risk": "background-color:#f3e8fd"}
+    return colors.get(val, "")
 
 # ===========================================================================
 # TAB 1: OVERVIEW DASHBOARD
 # ===========================================================================
 with tab_overview:
     st.subheader("Overview Dashboard")
-    st.caption(f"Scope: {len(stores_selected)} store(s), {len(product_ids_selected)} product(s), "
-               f"forecast period = {forecast_period} days, as of {AS_OF_DATE.date()}.")
+    st.caption(f"All 6 stores × all 3 SKUs · forecast period = {forecast_period} days · as of {AS_OF_DATE.date()}.")
 
     total_current_inventory = risk_table["Current_Stock"].sum()
     total_forecast_demand = risk_table["Forecast_Period_Demand"].sum()
@@ -217,136 +191,149 @@ with tab_movement:
     )
 
 # ===========================================================================
-# TAB 3: DEMAND FORECASTING
+# TAB 3: DEMAND FORECASTING — all stores, all SKUs
 # ===========================================================================
 with tab_forecast:
-    st.subheader(f"Demand Forecasting — {focus_product_name} @ {focus_store}")
+    st.subheader("Demand Forecasting — All Stores × All SKUs")
     st.write(
         "**Baseline model (primary):** 7-day moving average of historical `Units_Sold`, "
         "projected forward as a flat daily rate. `Simulated_True_Demand` is **not** used "
-        "as a model input, to avoid data leakage — it is reserved for later evaluation only."
+        "as a model input, to avoid data leakage — it is reserved for later evaluation only. "
+        "The chart below aggregates all 6 stores together for each SKU, so all three "
+        "products are visible on one screen."
     )
-
-    baseline = baseline_moving_average_forecast(df, focus_store, focus_product_id, AS_OF_DATE, forecast_period)
-    trend = linear_trend_forecast(df, focus_store, focus_product_id, AS_OF_DATE, forecast_period)
 
     show_trend = st.checkbox(
         "Also show scikit-learn Linear Regression trend model (comparison only — not claimed superior)",
         value=False,
     )
 
-    hist = baseline["historical"].tail(60)
+    sku_colors = {"SKU001": "#2ca02c", "SKU002": "#ff7f0e", "SKU003": "#9467bd"}
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=hist["Date"], y=hist["Units_Sold"], mode="lines",
-                              name="Historical Units Sold", line=dict(color="#1f77b4")))
-    fig.add_trace(go.Scatter(x=baseline["forecast_dates"], y=baseline["forecast_values"], mode="lines+markers",
-                              name=f"Baseline Forecast ({baseline.get('window_used',7)}-day MA)",
-                              line=dict(color="#2ca02c", dash="dash")))
-    if show_trend and trend["forecast_dates"]:
-        fig.add_trace(go.Scatter(x=trend["forecast_dates"], y=trend["forecast_values"], mode="lines+markers",
-                                  name="Linear Trend (scikit-learn) — comparison only",
-                                  line=dict(color="#9467bd", dash="dot")))
-    fig.update_layout(title="Historical Sales vs Forecast", xaxis_title="Date", yaxis_title="Units Sold",
-                       legend=dict(orientation="h", y=-0.2))
+    for _, prod in PRODUCTS.iterrows():
+        sku = prod["Product_ID"]
+        # Network-wide historical: sum Units_Sold across all 6 stores, per day, for this SKU
+        hist_net = (
+            df[df["Product_ID"] == sku].groupby("Date")["Units_Sold"].sum().reset_index().tail(60)
+        )
+        fig.add_trace(go.Scatter(x=hist_net["Date"], y=hist_net["Units_Sold"], mode="lines",
+                                  name=f"{prod['Product_Name']} — Historical (network)",
+                                  line=dict(color=sku_colors.get(sku), width=2)))
+
+        # Network-wide forecast: sum each store's baseline forecast for this SKU
+        fc_dates, fc_totals = None, None
+        for store in STORES:
+            fc = baseline_moving_average_forecast(df, store, sku, AS_OF_DATE, forecast_period)
+            if fc_dates is None:
+                fc_dates = fc["forecast_dates"]
+                fc_totals = list(fc["forecast_values"])
+            else:
+                fc_totals = [a + b for a, b in zip(fc_totals, fc["forecast_values"])]
+        fig.add_trace(go.Scatter(x=fc_dates, y=fc_totals, mode="lines+markers",
+                                  name=f"{prod['Product_Name']} — Forecast (network)",
+                                  line=dict(color=sku_colors.get(sku), dash="dash")))
+
+        if show_trend:
+            tr_dates, tr_totals = None, None
+            for store in STORES:
+                tr = linear_trend_forecast(df, store, sku, AS_OF_DATE, forecast_period)
+                if not tr["forecast_dates"]:
+                    continue
+                if tr_dates is None:
+                    tr_dates = tr["forecast_dates"]
+                    tr_totals = list(tr["forecast_values"])
+                else:
+                    tr_totals = [a + b for a, b in zip(tr_totals, tr["forecast_values"])]
+            if tr_dates:
+                fig.add_trace(go.Scatter(x=tr_dates, y=tr_totals, mode="lines",
+                                          name=f"{prod['Product_Name']} — Linear Trend (comparison)",
+                                          line=dict(color=sku_colors.get(sku), dash="dot", width=1)))
+
+    fig.update_layout(title="Network-Wide Historical Sales vs Forecast (all stores combined, per SKU)",
+                       xaxis_title="Date", yaxis_title="Units Sold (all 6 stores)",
+                       legend=dict(orientation="h", y=-0.25))
     st.plotly_chart(fig, use_container_width=True)
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Forecast period", f"{forecast_period} days")
-    m2.metric("Avg daily forecast (baseline)", f"{baseline['avg_daily_rate']:.1f} units")
-    m3.metric("Total forecasted demand", f"{baseline['avg_daily_rate']*forecast_period:.0f} units")
+    st.markdown("**Forecast summary — every store × SKU**")
+    fc_display = full_table[["Store", "Product", "SKU", "Avg_Daily_Forecast", "Forecast_Period_Demand"]].rename(
+        columns={"Avg_Daily_Forecast": "Avg Daily Forecast", "Forecast_Period_Demand": f"Forecast (next {forecast_period}d)"}
+    )
+    st.dataframe(fc_display, use_container_width=True, hide_index=True)
 
-    with st.expander("Forecast values (baseline model)"):
-        fc_df = pd.DataFrame({"Date": baseline["forecast_dates"], "Forecasted Units": baseline["forecast_values"]})
-        st.dataframe(fc_df, use_container_width=True, hide_index=True)
+    totals_by_sku = full_table.groupby("Product")["Forecast_Period_Demand"].sum().reset_index()
+    cols = st.columns(len(totals_by_sku))
+    for col, (_, row) in zip(cols, totals_by_sku.iterrows()):
+        col.metric(f"{row['Product']} — Network Total (next {forecast_period}d)", f"{row['Forecast_Period_Demand']:,.0f} units")
 
     if show_trend:
         st.caption(
-            f"Linear trend slope: {trend.get('trend_slope_per_day', 0):+.2f} units/day over the trailing "
-            f"60 days. Shown for comparison only — no back-testing has been performed in this Sprint 2 "
-            f"prototype, so no accuracy claim is made about either model."
+            "Linear trend lines are shown for comparison only — no back-testing has been performed "
+            "in this Sprint 2 prototype, so no accuracy claim is made about either model."
         )
 
 # ===========================================================================
-# TAB 4: INVENTORY MONITORING
+# TAB 4: INVENTORY MONITORING — all stores, all SKUs
 # ===========================================================================
 with tab_inventory:
-    st.subheader(f"Inventory Monitoring — {focus_product_name} @ {focus_store}")
+    st.subheader("Inventory Monitoring — All Stores × All SKUs")
+    st.caption(f"As of {AS_OF_DATE.date()} (the most recent date in the dataset).")
 
-    snap = current_snapshot(df, focus_store, focus_product_id, AS_OF_DATE)
-    if not snap:
-        st.warning("No data available for this store/product on the latest date.")
-    else:
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Opening Stock", snap["Opening_Stock"])
-        c2.metric("Incoming Stock", snap["Incoming_Stock"])
-        c3.metric("Units Sold", snap["Units_Sold"])
-        c4.metric("Closing Stock", snap["Closing_Stock"])
-        c5.metric("Wastage", snap["Wastage"])
-        c6.metric("Stockout Today?", snap["Stockout"])
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Opening Stock", f"{full_table['Opening_Stock'].sum():,.0f}")
+    k2.metric("Total Incoming Today", f"{full_table['Incoming_Stock_Today'].sum():,.0f}")
+    k3.metric("Total Units Sold Today", f"{full_table['Units_Sold_Today'].sum():,.0f}")
+    k4.metric("Total Closing Stock", f"{full_table['Current_Stock'].sum():,.0f}")
 
-        baseline = baseline_moving_average_forecast(df, focus_store, focus_product_id, AS_OF_DATE, forecast_period)
-        expected_demand = baseline["avg_daily_rate"] * forecast_period
-        exp = expiry_metrics(df, focus_store, focus_product_id, AS_OF_DATE)
-        # Risk uses lead-time demand (not period demand), consistent with the Risk Dashboard tab
-        lt_tmp = lead_time_metrics(df, focus_store, focus_product_id, AS_OF_DATE, baseline["avg_daily_rate"])
-        risk = classify_risk(lt_tmp["Current_Stock"], lt_tmp["Forecasted_Demand_During_Lead_Time"], exp.get("Days_Remaining", 999))
+    inv_display = full_table[[
+        "Store", "Product", "SKU", "Opening_Stock", "Incoming_Stock_Today", "Units_Sold_Today",
+        "Current_Stock", "Wastage_Today", "Stockout_Today", "Risk",
+    ]].rename(columns={
+        "Opening_Stock": "Opening Stock", "Incoming_Stock_Today": "Incoming Stock",
+        "Units_Sold_Today": "Units Sold", "Current_Stock": "Closing Stock",
+        "Wastage_Today": "Wastage", "Stockout_Today": "Stockout",
+    })
+    st.dataframe(inv_display.style.map(_risk_style, subset=["Risk"]), use_container_width=True, hide_index=True)
 
-        st.divider()
-        colx, coly = st.columns(2)
-        with colx:
-            st.metric(f"Available Stock vs Expected Demand (next {forecast_period}d)",
-                      f"{snap['Closing_Stock']:.0f} vs {expected_demand:.0f}",
-                      delta=f"{snap['Closing_Stock'] - expected_demand:+.0f} units")
-        with coly:
-            risk_color = {"Normal": "🟢", "Stockout Risk": "🔴", "Overstock Risk": "🟠", "Expiry Risk": "🟣"}
-            st.metric("Inventory Status", f"{risk_color.get(risk,'')} {risk}")
-
-        st.markdown("**Recent Inventory Trend (last 30 days)**")
-        hist30 = df[(df["Store"] == focus_store) & (df["Product_ID"] == focus_product_id)
-                    & (df["Date"] > AS_OF_DATE - pd.Timedelta(days=30))]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hist30["Date"], y=hist30["Closing_Stock"], name="Closing Stock", line=dict(color="#1f77b4")))
-        fig.add_trace(go.Bar(x=hist30["Date"], y=hist30["Wastage"], name="Wastage", marker_color="#d62728", opacity=0.5, yaxis="y2"))
-        fig.update_layout(
-            yaxis=dict(title="Closing Stock"),
-            yaxis2=dict(title="Wastage", overlaying="y", side="right"),
-            title="Closing Stock & Wastage (last 30 days)",
-        )
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        fig = px.bar(full_table, x="Store", y="Current_Stock", color="Product", barmode="group",
+                     title="Closing Stock by Store, split by SKU", labels={"Current_Stock": "Closing Stock"})
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        fig = px.bar(full_table, x="Store", y="Wastage_Today", color="Product", barmode="group",
+                     title="Today's Wastage by Store, split by SKU", labels={"Wastage_Today": "Wastage"})
         st.plotly_chart(fig, use_container_width=True)
 
 # ===========================================================================
-# TAB 5: LEAD-TIME TRACKING
+# TAB 5: LEAD-TIME TRACKING — all stores, all SKUs
 # ===========================================================================
 with tab_leadtime:
-    st.subheader("Lead-Time Tracking")
+    st.subheader("Lead-Time Tracking — All Stores × All SKUs")
     st.caption("Incoming stock shown here is a SIMULATED ESTIMATE (average stock received over the "
                "last Lead-Time-Days days), since the dataset does not record pending purchase orders explicitly.")
 
-    lt_rows = []
-    for _, prod in products_selected_df.iterrows():
-        baseline = baseline_moving_average_forecast(df, focus_store, prod["Product_ID"], AS_OF_DATE, forecast_period)
-        lt = lead_time_metrics(df, focus_store, prod["Product_ID"], AS_OF_DATE, baseline["avg_daily_rate"])
-        lt_rows.append({
-            "Product": prod["Product_Name"],
-            "SKU": prod["Product_ID"],
-            "Supplier Lead Time (days)": lt["Lead_Time_Days"],
-            "Forecasted Demand During Lead Time": round(lt["Forecasted_Demand_During_Lead_Time"], 1),
-            "Current Stock": lt["Current_Stock"],
-            "Incoming Stock (est.)": round(lt["Incoming_Stock_Estimate"], 1),
-        })
-    lt_df = pd.DataFrame(lt_rows)
-    st.dataframe(lt_df, use_container_width=True, hide_index=True)
-    st.caption(f"Store: {focus_store} · Forecast period: {forecast_period} days · As of {AS_OF_DATE.date()}")
+    lt_display = full_table[[
+        "Store", "Product", "SKU", "Lead_Time_Days", "Forecast_During_Lead_Time",
+        "Current_Stock", "Incoming_Stock_Estimate",
+    ]].rename(columns={
+        "Lead_Time_Days": "Supplier Lead Time (days)", "Forecast_During_Lead_Time": "Forecasted Demand During Lead Time",
+        "Current_Stock": "Current Stock", "Incoming_Stock_Estimate": "Incoming Stock (est.)",
+    })
+    st.dataframe(lt_display, use_container_width=True, hide_index=True)
+    st.caption(f"As of {AS_OF_DATE.date()} · Forecast period = {forecast_period} days.")
 
-    fig = px.bar(lt_df, x="Product", y=["Current Stock", "Incoming Stock (est.)", "Forecasted Demand During Lead Time"],
-                 barmode="group", title="Current Stock vs Forecasted Demand During Lead Time")
+    fig = px.bar(full_table, x="Store", y=["Current_Stock", "Incoming_Stock_Estimate", "Forecast_During_Lead_Time"],
+                 barmode="group", facet_col="Product",
+                 title="Current Stock vs Forecasted Demand During Lead Time, by Store & SKU",
+                 labels={"value": "Units", "variable": "Metric"})
     st.plotly_chart(fig, use_container_width=True)
 
 # ===========================================================================
-# TAB 6: EXPIRY TRACKING
+# TAB 6: EXPIRY TRACKING — all stores, all SKUs
 # ===========================================================================
 with tab_expiry:
-    st.subheader("Expiry Tracking")
+    st.subheader("Expiry Tracking — All Stores × All SKUs")
     st.warning(
         "**Simulated/prototype values.** This dataset is not connected to Colonial Fresh's live "
         "operational systems. Days Remaining reflects the shelf life of the most recently received "
@@ -354,67 +341,64 @@ with tab_expiry:
         icon="⚠️",
     )
 
-    exp_rows = []
-    for _, prod in products_selected_df.iterrows():
-        exp = expiry_metrics(df, focus_store, prod["Product_ID"], AS_OF_DATE)
-        if not exp:
-            continue
-        days_rem = exp["Days_Remaining"]
-        exp_risk = "Expiry Risk" if days_rem <= 2 else ("Watch" if days_rem <= 4 else "OK")
-        exp_rows.append({
-            "Product": prod["Product_Name"],
-            "SKU": prod["Product_ID"],
-            "Shelf Life (days)": exp["Shelf_Life_Days"],
-            "Expiry Date": exp["Expiry_Date"].date(),
-            "Days Remaining": days_rem,
-            "Expiry Risk": exp_risk,
-        })
-    exp_df = pd.DataFrame(exp_rows)
-    st.dataframe(exp_df, use_container_width=True, hide_index=True)
-    st.caption(f"Store: {focus_store} · As of {AS_OF_DATE.date()}")
+    exp_display = full_table.copy()
+    exp_display["Expiry Risk"] = exp_display["Days_To_Expiry"].apply(
+        lambda d: "Expiry Risk" if d <= 2 else ("Watch" if d <= 4 else "OK")
+    )
+    exp_display = exp_display[[
+        "Store", "Product", "SKU", "Shelf_Life_Days", "Expiry_Date", "Days_To_Expiry", "Expiry Risk",
+    ]].rename(columns={"Shelf_Life_Days": "Shelf Life (days)", "Expiry_Date": "Expiry Date", "Days_To_Expiry": "Days Remaining"})
+
+    def _expiry_style(val):
+        colors = {"Expiry Risk": "background-color:#f3e8fd", "Watch": "background-color:#fef3e2", "OK": "background-color:#e6f4ea"}
+        return colors.get(val, "")
+
+    st.dataframe(exp_display.style.map(_expiry_style, subset=["Expiry Risk"]), use_container_width=True, hide_index=True)
+    st.caption(f"As of {AS_OF_DATE.date()}")
 
 # ===========================================================================
-# TAB 7: DEMAND-BASED REORDER RECOMMENDATION
+# TAB 7: DEMAND-BASED REORDER RECOMMENDATION — all stores, all SKUs
 # ===========================================================================
 with tab_reorder:
-    st.subheader(f"Demand-Based Reorder Recommendation — {focus_product_name} @ {focus_store}")
-
-    baseline = baseline_moving_average_forecast(df, focus_store, focus_product_id, AS_OF_DATE, forecast_period)
-    lt = lead_time_metrics(df, focus_store, focus_product_id, AS_OF_DATE, baseline["avg_daily_rate"])
-    reorder = calculate_reorder(lt["Forecasted_Demand_During_Lead_Time"], lt["Current_Stock"], lt["Incoming_Stock_Estimate"])
+    st.subheader("Demand-Based Reorder Recommendation — All Stores × All SKUs")
 
     st.markdown("**Formula:** `Recommended Order = Forecasted Demand During Lead Time + Safety Stock − Current Stock − Incoming Stock`")
     st.markdown("**Safety Stock = 20% of Forecasted Demand During Lead Time**")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Forecasted Demand During Lead Time", f"{lt['Forecasted_Demand_During_Lead_Time']:.1f}")
-    c2.metric("Safety Stock (20%)", f"{reorder['Safety_Stock']:.1f}")
-    c3.metric("Current Stock", f"{lt['Current_Stock']:.0f}")
-    c4.metric("Incoming Stock (est.)", f"{lt['Incoming_Stock_Estimate']:.1f}")
-
-    st.markdown(
-        f"**Calculation:** {lt['Forecasted_Demand_During_Lead_Time']:.1f} + {reorder['Safety_Stock']:.1f} "
-        f"− {lt['Current_Stock']:.0f} − {lt['Incoming_Stock_Estimate']:.1f} "
-        f"= **{reorder['Raw_Calculation']:.1f}** → Recommended Order = **{reorder['Recommended_Order']:.0f} units**"
+    st.caption(
+        "The system recommends an order whenever available inventory (plus what's already inbound) "
+        "is below the expected demand requirement during the replenishment period."
     )
 
-    if reorder["Recommended_Order"] > 0:
+    total_recommended = full_table["Recommended_Order"].sum()
+    combos_needing_order = (full_table["Recommended_Order"] > 0).sum()
+    m1, m2 = st.columns(2)
+    m1.metric("Total Recommended Reorder (network)", f"{total_recommended:,.0f} units")
+    m2.metric("Store × SKU combos needing an order", f"{combos_needing_order} / {len(full_table)}")
+
+    reorder_display = full_table[[
+        "Store", "Product", "SKU", "Forecast_During_Lead_Time", "Safety_Stock",
+        "Current_Stock", "Incoming_Stock_Estimate", "Raw_Calculation", "Recommended_Order", "Risk",
+    ]].rename(columns={
+        "Forecast_During_Lead_Time": "Forecast During Lead Time", "Safety_Stock": "Safety Stock (20%)",
+        "Current_Stock": "Current Stock", "Incoming_Stock_Estimate": "Incoming Stock (est.)",
+        "Raw_Calculation": "Raw Calculation", "Recommended_Order": "Recommended Order",
+    })
+    st.dataframe(reorder_display.style.map(_risk_style, subset=["Risk"]), use_container_width=True, hide_index=True)
+
+    if combos_needing_order > 0:
         st.success(
-            "The system recommends this order because available inventory is below the expected "
-            "demand requirement during the replenishment period."
+            f"{combos_needing_order} store × SKU combination(s) currently need a reorder — "
+            f"see the highlighted rows above for the full step-by-step calculation."
         )
     else:
-        st.success(
-            "No reorder is currently recommended — available inventory and incoming stock are "
-            "sufficient to cover expected demand during the replenishment period."
-        )
+        st.success("No reorders are currently recommended anywhere in the network.")
 
 # ===========================================================================
 # TAB 8: RISK DASHBOARD
 # ===========================================================================
 with tab_risk:
     st.subheader("Risk Dashboard")
-    st.caption(f"Dynamically calculated for all selected stores × SKUs · as of {AS_OF_DATE.date()} · "
+    st.caption(f"Dynamically calculated for all 6 stores × 3 SKUs · as of {AS_OF_DATE.date()} · "
                f"forecast period = {forecast_period} days.")
 
     display_cols = ["Store", "SKU", "Product", "Movement", "Current_Stock",
@@ -425,13 +409,8 @@ with tab_risk:
         "Recommended_Order": "Recommended Order",
     })
 
-    def _risk_color(val):
-        colors = {"Normal": "background-color:#e6f4ea", "Stockout Risk": "background-color:#fce8e6",
-                  "Overstock Risk": "background-color:#fef3e2", "Expiry Risk": "background-color:#f3e8fd"}
-        return colors.get(val, "")
-
     st.dataframe(
-        display_df.style.map(_risk_color, subset=["Risk"]),
+        display_df.style.map(_risk_style, subset=["Risk"]),
         use_container_width=True, hide_index=True,
     )
 
@@ -512,15 +491,10 @@ with tab_live:
         st.divider()
         st.markdown("**Today's snapshot — all stores × SKUs**")
 
-        def _risk_color_live(val):
-            colors = {"Normal": "background-color:#e6f4ea", "Stockout Risk": "background-color:#fce8e6",
-                      "Overstock Risk": "background-color:#fef3e2", "Expiry Risk": "background-color:#f3e8fd"}
-            return colors.get(val, "")
-
         show_cols = ["Store", "Product_Name", "Opening_Stock", "Incoming_Stock", "Units_Sold",
                      "Closing_Stock", "Wastage", "Stockout", "Recommended_Order", "Risk"]
         st.dataframe(
-            today_log[show_cols].rename(columns={"Product_Name": "Product"}).style.map(_risk_color_live, subset=["Risk"]),
+            today_log[show_cols].rename(columns={"Product_Name": "Product"}).style.map(_risk_style, subset=["Risk"]),
             use_container_width=True, hide_index=True,
         )
 
@@ -566,20 +540,22 @@ with tab_live:
         fig2.update_layout(title="Total Network Stock On Hand Over Time", xaxis_title="Date", yaxis_title="Units")
         st.plotly_chart(fig2, use_container_width=True)
 
-        st.markdown(f"**Drill-down: {focus_product_name} @ {focus_store}** (using the focus selectors in the sidebar)")
-        combo_log = sim_log[(sim_log["Store"] == focus_store) & (sim_log["Product_ID"] == focus_product_id)]
-        if combo_log.empty:
-            st.caption("No simulated days yet for this store/SKU.")
+        st.markdown("**Stock level by SKU, all stores combined**")
+        stock_by_sku = sim_log.groupby(["Date", "Product_Name"])["Closing_Stock"].sum().reset_index()
+        fig3 = px.line(stock_by_sku, x="Date", y="Closing_Stock", color="Product_Name",
+                        title="Closing Stock Over Time by SKU (summed across all 6 stores)",
+                        labels={"Closing_Stock": "Closing Stock", "Product_Name": "Product"})
+        st.plotly_chart(fig3, use_container_width=True)
+
+        st.markdown("**Reorders placed by store, all SKUs combined**")
+        orders_by_store = sim_log.groupby(["Date", "Store"])["Recommended_Order"].sum().reset_index()
+        orders_by_store = orders_by_store[orders_by_store["Recommended_Order"] > 0]
+        if orders_by_store.empty:
+            st.caption("No reorders placed yet.")
         else:
-            fig3 = go.Figure()
-            fig3.add_trace(go.Scatter(x=combo_log["Date"], y=combo_log["Closing_Stock"], name="Closing Stock", line=dict(color="#1f77b4")))
-            fig3.add_trace(go.Bar(x=combo_log["Date"], y=combo_log["Recommended_Order"], name="Order Placed", marker_color="#ff7f0e", opacity=0.6, yaxis="y2"))
-            fig3.update_layout(
-                yaxis=dict(title="Closing Stock"),
-                yaxis2=dict(title="Order Placed", overlaying="y", side="right"),
-                title=f"{focus_product_name} @ {focus_store}: Stock Level & Reorders (simulated)",
-            )
-            st.plotly_chart(fig3, use_container_width=True)
+            fig4 = px.bar(orders_by_store, x="Date", y="Recommended_Order", color="Store",
+                          title="Units Reordered per Day, by Store", labels={"Recommended_Order": "Units Reordered"})
+            st.plotly_chart(fig4, use_container_width=True)
 
     if st.session_state.sim_autoplay:
         time.sleep(st.session_state.sim_speed)

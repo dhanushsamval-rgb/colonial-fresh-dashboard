@@ -12,14 +12,20 @@ three baseline SKUs (Bananas, Apples, Strawberries) across six Colonial Fresh st
 
 ## What this Sprint 2 prototype covers
 
-1. Overview Dashboard (KPIs + filters for store, product, forecast period)
+**This dashboard always shows all 6 stores × all 3 SKUs together — nothing is filtered or
+hidden anywhere.** The only control in the sidebar is the forecast horizon (7/14/30 days),
+since that's a genuine parameter choice rather than something that hides data. This was a
+deliberate design choice to make the app easy to present end-to-end without pausing to
+change dropdowns.
+
+1. Overview Dashboard (network-wide KPIs)
 2. Product Movement Analysis (data-driven fast/moderate/slow classification)
-3. Demand Forecasting (7-day moving-average baseline; optional scikit-learn linear-trend comparison)
-4. Inventory Monitoring (Opening/Incoming/Sold/Closing/Wastage/Stockout)
-5. Lead-Time Tracking (forecast during lead time)
-6. Expiry Tracking (shelf life / expiry date / days remaining — labelled as simulated)
-7. Demand-Based Reorder Recommendation (transparent formula, shown step-by-step)
-8. Risk Dashboard (Normal / Stockout Risk / Overstock Risk / Expiry Risk, all SKUs × stores)
+3. Demand Forecasting (7-day moving-average baseline, aggregated across all stores per SKU; optional scikit-learn linear-trend comparison)
+4. Inventory Monitoring (Opening/Incoming/Sold/Closing/Wastage/Stockout — every store × SKU in one table)
+5. Lead-Time Tracking (forecast during lead time — every store × SKU)
+6. Expiry Tracking (shelf life / expiry date / days remaining — every store × SKU, labelled as simulated)
+7. Demand-Based Reorder Recommendation (full formula breakdown — every store × SKU)
+8. Risk Dashboard (Normal / Stockout Risk / Overstock Risk / Expiry Risk, all 18 combos)
 9. **Live Simulation** (full 6-store × 3-SKU network, running forward day-by-day — see below)
 10. Solution Architecture (the Sprint 2 design write-up, embedded in the app)
 
