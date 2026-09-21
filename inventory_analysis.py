@@ -164,8 +164,70 @@ def classify_risk(
     return "Normal"
 
 
+def assess_stock_position(
+    current_stock: float, forecast_during_lead_time: float, safety_stock: float,
+    overstock_multiplier: float = OVERSTOCK_MULTIPLIER,
+) -> dict:
+    """
+    Turn the same numbers already used for the reorder calculation into a plain-language
+    verdict on whether a given stock level is right, understocked, or overstocked -
+    grounded entirely in the demand forecast and the reorder-point logic already used
+    everywhere else in the app (no separate/second forecast, no new assumptions).
+
+    Bands (all derived from the existing reorder formula's own building blocks):
+    - < Forecast During Lead Time                          -> Understocked (can't even cover the bare minimum)
+    - Forecast During Lead Time .. Reorder Point            -> Below Target (survives, but under the 20% safety buffer)
+    - Reorder Point .. Overstock Threshold                  -> Well Stocked (right in the healthy zone)
+    - > Overstock Threshold (overstock_multiplier x FDLT)   -> Overstocked (tying up cash, raising expiry risk)
+    """
+    reorder_point = forecast_during_lead_time + safety_stock  # = the target level a fresh order should bring stock to
+    overstock_threshold = overstock_multiplier * forecast_during_lead_time if forecast_during_lead_time > 0 else None
+
+    if forecast_during_lead_time <= 0:
+        status = "Insufficient Data"
+        message = "No meaningful demand forecast is available for this combination yet, so a stocking verdict can't be calculated."
+    elif current_stock < forecast_during_lead_time:
+        status = "Understocked"
+        message = (
+            f"Current stock ({current_stock:.0f} units) is below the {forecast_during_lead_time:.0f} units "
+            f"the demand forecast says are needed just to survive until the next delivery arrives. "
+            f"This is a genuine stockout risk, not just a thin buffer."
+        )
+    elif current_stock < reorder_point:
+        status = "Below Target"
+        message = (
+            f"Current stock ({current_stock:.0f} units) covers forecasted demand during the lead time "
+            f"({forecast_during_lead_time:.0f} units) but sits below the {reorder_point:.0f}-unit reorder point "
+            f"(forecast + 20% safety stock). Workable, but with little margin for a demand spike."
+        )
+    elif overstock_threshold is not None and current_stock > overstock_threshold:
+        status = "Overstocked"
+        message = (
+            f"Current stock ({current_stock:.0f} units) is well above the {overstock_threshold:.0f}-unit "
+            f"overstock threshold (2x forecasted demand during the lead time). This ties up cash and, for "
+            f"a perishable product, raises the chance some of it expires before it sells."
+        )
+    else:
+        status = "Well Stocked"
+        message = (
+            f"Current stock ({current_stock:.0f} units) sits comfortably between the {forecast_during_lead_time:.0f}-unit "
+            f"minimum and the {overstock_threshold:.0f}-unit overstock threshold — right in the healthy zone the "
+            f"demand forecast and reorder-point logic are aiming for."
+        )
+
+    return {
+        "status": status,
+        "message": message,
+        "forecast_during_lead_time": forecast_during_lead_time,
+        "reorder_point": reorder_point,
+        "overstock_threshold": overstock_threshold,
+        "current_stock": current_stock,
+    }
+
+
 def build_full_snapshot_table(
-    df: pd.DataFrame, stores: list, products: pd.DataFrame, as_of_date: pd.Timestamp, forecast_days: int
+    df: pd.DataFrame, stores: list, products: pd.DataFrame, as_of_date: pd.Timestamp, forecast_days: int,
+    stock_adjustments: dict = None,
 ) -> pd.DataFrame:
     """
     Build ONE comprehensive table covering every Store x SKU combination, with every
@@ -176,7 +238,14 @@ def build_full_snapshot_table(
     This exists so the dashboard can show "everything, all stores, all SKUs" at once
     (no manual filtering needed) without duplicating the underlying business logic -
     it reuses the exact same functions as the rest of the app.
+
+    `stock_adjustments`, if given, is a {(store, product_id): net_units} dict of
+    manually logged stock receipts (from the Stock Intake tab). These are ADDED to
+    the dataset's Current_Stock (Closing_Stock) figure before any downstream
+    lead-time, reorder or risk calculation, so a manual stock entry genuinely
+    changes what the rest of the app recommends - it isn't just a display note.
     """
+    stock_adjustments = stock_adjustments or {}
     rows = []
     for store in stores:
         for _, prod in products.iterrows():
@@ -187,6 +256,9 @@ def build_full_snapshot_table(
             avg_daily = fc["avg_daily_rate"]
 
             lt = lead_time_metrics(df, store, product_id, as_of_date, avg_daily)
+            adjustment = stock_adjustments.get((store, product_id), 0)
+            lt["Current_Stock"] = lt["Current_Stock"] + adjustment
+
             exp = expiry_metrics(df, store, product_id, as_of_date)
             reorder = calculate_reorder(
                 lt["Forecasted_Demand_During_Lead_Time"], lt["Current_Stock"], lt["Incoming_Stock_Estimate"]
@@ -204,7 +276,8 @@ def build_full_snapshot_table(
                 "Opening_Stock": snap.get("Opening_Stock"),
                 "Incoming_Stock_Today": snap.get("Incoming_Stock"),
                 "Units_Sold_Today": snap.get("Units_Sold"),
-                "Current_Stock": lt["Current_Stock"],  # = today's Closing_Stock
+                "Current_Stock": lt["Current_Stock"],  # = today's Closing_Stock + manual adjustments
+                "Manual_Adjustment": adjustment,
                 "Wastage_Today": snap.get("Wastage"),
                 "Stockout_Today": snap.get("Stockout"),
                 # Forecast
@@ -229,13 +302,16 @@ def build_full_snapshot_table(
 
 
 def build_risk_table(
-    df: pd.DataFrame, stores: list, products: pd.DataFrame, as_of_date: pd.Timestamp, forecast_days: int
+    df: pd.DataFrame, stores: list, products: pd.DataFrame, as_of_date: pd.Timestamp, forecast_days: int,
+    stock_adjustments: dict = None,
 ) -> pd.DataFrame:
     """
     Build the full Risk Dashboard table:
     SKU | Movement | Store | Current Stock | Forecast | Lead Time | Expiry | Risk | Recommended Order
-    Populated dynamically for every store x SKU combination in scope.
+    Populated dynamically for every store x SKU combination in scope. `stock_adjustments`
+    behaves exactly as in build_full_snapshot_table.
     """
+    stock_adjustments = stock_adjustments or {}
     rows = []
     for store in stores:
         for _, prod in products.iterrows():
@@ -244,6 +320,8 @@ def build_risk_table(
             avg_daily = fc["avg_daily_rate"]
 
             lt = lead_time_metrics(df, store, product_id, as_of_date, avg_daily)
+            lt["Current_Stock"] = lt["Current_Stock"] + stock_adjustments.get((store, product_id), 0)
+
             exp = expiry_metrics(df, store, product_id, as_of_date)
             reorder = calculate_reorder(
                 lt["Forecasted_Demand_During_Lead_Time"], lt["Current_Stock"], lt["Incoming_Stock_Estimate"]

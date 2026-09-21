@@ -37,6 +37,14 @@ DAY_TO_DAY_NOISE_STD = 0.15        # +/-15% random variation around the base rat
 WEEKDAY_FACTOR_CLIP = (0.5, 1.6)   # sanity bounds on learned seasonality
 PROMO_BOOST_CLIP = (1.0, 2.0)      # sanity bounds on learned promotion uplift
 DEFAULT_PROMO_BOOST = 1.15
+LEAD_TIME_VARIABILITY_RATE = 0.3   # SIMULATED: assumed std as a fraction of the dataset's
+                                    # fixed Lead_Time_Days. The real dataset records a single
+                                    # constant lead time per SKU with no day-to-day variability
+                                    # to learn from, so this spread is an explicit, disclosed
+                                    # assumption used only to give the Live Simulation and the
+                                    # Lead-Time Anticipation tab something genuine to observe
+                                    # and learn from, rather than a constant that can't be
+                                    # "anticipated" at all.
 
 SIM_LOG_COLUMNS = [
     "Date", "Store", "Product_ID", "Product_Name", "Opening_Stock",
@@ -44,6 +52,8 @@ SIM_LOG_COLUMNS = [
     "Promotion", "Avg_Daily_Forecast", "Forecast_During_Lead_Time",
     "Recommended_Order", "Risk",
 ]
+
+LEAD_TIME_LOG_COLUMNS = ["Order_Date", "Store", "Product_ID", "Product_Name", "Planned_Lead_Time", "Actual_Lead_Time", "Arrival_Date"]
 
 
 def _learn_combo_profile(hist: pd.DataFrame) -> dict:
@@ -104,6 +114,7 @@ def init_simulation_state(df: pd.DataFrame, stores: list, products: pd.DataFrame
         "sim_date": as_of_date,
         "combos": combos,
         "log": pd.DataFrame(columns=SIM_LOG_COLUMNS),
+        "lead_time_log": pd.DataFrame(columns=LEAD_TIME_LOG_COLUMNS),
         "rng": rng,
         "days_simulated": 0,
     }
@@ -119,6 +130,7 @@ def simulate_next_day(state: dict) -> dict:
     weekday = new_date.dayofweek
 
     new_rows = []
+    new_lead_time_rows = []
     for (store, sku), c in state["combos"].items():
         # 1) Resolve any pending orders arriving today
         arriving_today = sum(qty for (arr_date, qty) in c["pending_orders"] if arr_date == new_date)
@@ -160,7 +172,16 @@ def simulate_next_day(state: dict) -> dict:
         recommended_order = reorder["Recommended_Order"]
 
         if recommended_order > 0:
-            c["pending_orders"].append((new_date + pd.Timedelta(days=lead_time_days), recommended_order))
+            planned_lead_time = lead_time_days
+            lead_time_std = max(1.0, planned_lead_time * LEAD_TIME_VARIABILITY_RATE)
+            actual_lead_time = int(max(1, round(rng.normal(planned_lead_time, lead_time_std))))
+            arrival_date = new_date + pd.Timedelta(days=actual_lead_time)
+            c["pending_orders"].append((arrival_date, recommended_order))
+            new_lead_time_rows.append({
+                "Order_Date": new_date, "Store": store, "Product_ID": sku, "Product_Name": c["product_name"],
+                "Planned_Lead_Time": planned_lead_time, "Actual_Lead_Time": actual_lead_time,
+                "Arrival_Date": arrival_date,
+            })
 
         # 7) Risk classification (reuses the same classify_risk thresholds/logic as the
         #    historical dashboard - unchanged). For the LIVE simulation only, we feed in
@@ -190,4 +211,36 @@ def simulate_next_day(state: dict) -> dict:
     state["days_simulated"] += 1
     if new_rows:
         state["log"] = pd.concat([state["log"], pd.DataFrame(new_rows)], ignore_index=True)
+    if new_lead_time_rows:
+        state["lead_time_log"] = pd.concat([state["lead_time_log"], pd.DataFrame(new_lead_time_rows)], ignore_index=True)
     return state
+
+
+def anticipate_lead_time(lead_time_log: pd.DataFrame, store: str, sku: str, planned_lead_time: int) -> dict:
+    """
+    Turn the observed actual-vs-planned delivery history for one Store+SKU (built up as
+    the Live Simulation runs) into an "anticipated" next delivery estimate: the observed
+    mean actual lead time and its standard deviation, giving a genuine data-driven
+    prediction range rather than just repeating the fixed textbook lead time.
+
+    Returns None-valued fields when no observations exist yet for this combo (i.e. the
+    simulation hasn't placed any orders for it), so the caller can fall back to the
+    static planned lead time and say so honestly.
+    """
+    sub = lead_time_log[(lead_time_log["Store"] == store) & (lead_time_log["Product_ID"] == sku)]
+    n = len(sub)
+    if n == 0:
+        return {
+            "n_observations": 0, "anticipated_days": planned_lead_time, "std_days": None,
+            "low": planned_lead_time, "high": planned_lead_time,
+        }
+    actual = sub["Actual_Lead_Time"].astype(float)
+    mean = float(actual.mean())
+    std = float(actual.std()) if n > 1 else 0.0
+    return {
+        "n_observations": n,
+        "anticipated_days": round(mean, 1),
+        "std_days": round(std, 1),
+        "low": max(1, round(mean - std)),
+        "high": round(mean + std),
+    }

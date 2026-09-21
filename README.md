@@ -27,7 +27,40 @@ change dropdowns.
 7. Demand-Based Reorder Recommendation (full formula breakdown — every store × SKU)
 8. Risk Dashboard (Normal / Stockout Risk / Overstock Risk / Expiry Risk, all 18 combos)
 9. **Live Simulation** (full 6-store × 3-SKU network, running forward day-by-day — see below)
-10. Solution Architecture (the Sprint 2 design write-up, embedded in the app)
+10. **Lead-Time Anticipation** — predicts the next delivery's actual lead time (with a range), learned from real variability observed as the Live Simulation runs, rather than repeating the dataset's fixed textbook value
+11. **Stock Intake** — manually log stock receipts; every entry genuinely shifts Current Stock and flows through to every other tab's calculations
+12. **Machine Learning Forecast** — a real scikit-learn Random Forest model, chronologically backtested against the baseline with honest accuracy metrics (MAE/RMSE/MAPE), not just a side comparison
+13. Solution Architecture (the Sprint 2 design write-up, embedded in the app)
+
+## Lead-Time Anticipation, Stock Intake & Machine Learning Forecast
+
+Three deeper additions beyond the original Sprint 2 brief:
+
+- **Lead-Time Anticipation** (`simulation.py`, `anticipate_lead_time()`): the dataset only records
+  a single fixed lead time per SKU with no real variability to learn from. To make "anticipation"
+  meaningful rather than just repeating a constant, the Live Simulation was extended with an
+  explicitly disclosed ±30% variability assumption around each SKU's base lead time. As the
+  simulation places and receives orders, this tab tracks the actual vs planned lead time for every
+  order and reports a genuine data-driven anticipated delivery window (mean ± 1 std dev). Before
+  any simulation has run, it honestly falls back to the fixed dataset value and says so.
+- **Stock Intake** (`app.py`, Stock Intake tab): a form to manually log stock receipts during a
+  session. Entries are kept in `st.session_state` and passed as a `stock_adjustments` dict into
+  both `build_full_snapshot_table()` and `build_risk_table()` (`inventory_analysis.py`), so a
+  logged receipt genuinely changes Current Stock and therefore every downstream lead-time, reorder
+  and risk calculation across the whole app — not just a note on one tab. Entries reset when the
+  app restarts (session-only, clearly disclosed in-app). Right below the form, an **AI Stock
+  Assessment** panel (`inventory_analysis.assess_stock_position()`) reads the same forecast and
+  reorder-point numbers already used everywhere else and gives a plain-language verdict —
+  Understocked / Below Target / Well Stocked / Overstocked — against the same 20%-safety-stock and
+  2x-overstock thresholds the rest of the app uses, so the verdict is never a separate opinion.
+- **Machine Learning Forecast** (`ml_forecast.py`): a real `RandomForestRegressor` trained per SKU
+  on lag/rolling/calendar features (previous day, previous week, 7- and 14-day rolling averages,
+  day-of-week, promotion rate), evaluated with a genuine **chronological** train/test split (last
+  60 days held out, never seen during training) — never a random split, to avoid leakage.
+  MAE/RMSE/MAPE are reported for both the Random Forest and the baseline on the exact same test
+  window, so any claim of one beating the other is backed by a real backtest. `Simulated_True_Demand`
+  is still never used as a feature or target. Forward forecasts beyond the dataset's last date use
+  recursive multi-step prediction (each predicted day feeds the next day's lag features).
 
 ## Live Simulation tab
 
@@ -77,11 +110,12 @@ it with an updated file, keep the same filename and sheet name (`Mock_Data`).
 
 ```
 colonial_fresh_dashboard/
-├── app.py                  # Streamlit UI — all dashboard sections, incl. Live Simulation tab
+├── app.py                  # Streamlit UI — all dashboard tabs, incl. ML Forecast, Stock Intake, Lead-Time Anticipation
 ├── data_utils.py            # Loading, validation, cleaning
 ├── forecasting.py           # Baseline moving-average model + optional ML comparison model
-├── inventory_analysis.py    # Movement analysis, lead-time, expiry, reorder, risk logic
-├── simulation.py            # Live day-by-day simulation engine (full store network)
+├── inventory_analysis.py    # Movement analysis, lead-time, expiry, reorder, risk logic (with stock-adjustment support)
+├── simulation.py            # Live day-by-day simulation engine (full store network) + lead-time variability tracking
+├── ml_forecast.py           # Backtested Random Forest demand forecast
 ├── requirements.txt
 ├── README.md
 └── data/

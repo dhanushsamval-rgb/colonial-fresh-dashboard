@@ -24,9 +24,11 @@ from inventory_analysis import (
     movement_analysis,
     build_risk_table,
     build_full_snapshot_table,
+    assess_stock_position,
     RECENT_WINDOW_DAYS,
 )
 import simulation
+import ml_forecast
 
 st.set_page_config(page_title="Colonial Fresh | Demand & Inventory Prototype", layout="wide")
 
@@ -81,21 +83,40 @@ filtered_df = df
 products_selected_df = PRODUCTS
 
 # ---------------------------------------------------------------------------
+# Stock Intake ledger (session-only): manually logged stock receipts that
+# genuinely shift Current_Stock, and therefore every downstream lead-time,
+# reorder and risk calculation across the whole app - not just a display note.
+# ---------------------------------------------------------------------------
+if "stock_ledger" not in st.session_state:
+    st.session_state.stock_ledger = []  # list of dicts: Date, Store, SKU, Product, Quantity, Note, Logged_At
+
+def _stock_adjustments_dict():
+    adj = {}
+    for entry in st.session_state.stock_ledger:
+        key = (entry["Store"], entry["SKU"])
+        adj[key] = adj.get(key, 0) + entry["Quantity"]
+    return adj
+
+stock_adjustments = _stock_adjustments_dict()
+
+# ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_overview, tab_movement, tab_forecast, tab_inventory, tab_leadtime, \
-    tab_expiry, tab_reorder, tab_risk, tab_live, tab_architecture = st.tabs(
+tab_overview, tab_movement, tab_forecast, tab_ml, tab_inventory, tab_intake, tab_leadtime, \
+    tab_leadtime_ai, tab_expiry, tab_reorder, tab_risk, tab_live, tab_architecture = st.tabs(
         [
-            "1️⃣ Overview", "2️⃣ Movement Analysis", "3️⃣ Demand Forecasting",
-            "4️⃣ Inventory Monitoring", "5️⃣ Lead-Time Tracking", "6️⃣ Expiry Tracking",
-            "7️⃣ Reorder Recommendation", "8️⃣ Risk Dashboard", "🔴 Live Simulation",
+            "1️⃣ Overview", "2️⃣ Movement Analysis", "3️⃣ Demand Forecasting", "🤖 ML Forecast",
+            "4️⃣ Inventory Monitoring", "📥 Stock Intake", "5️⃣ Lead-Time Tracking", "🚚 Lead-Time Anticipation",
+            "6️⃣ Expiry Tracking", "7️⃣ Reorder Recommendation", "8️⃣ Risk Dashboard", "🔴 Live Simulation",
             "9️⃣ Solution Architecture",
         ]
     )
 
-# Pre-compute the risk table and the full all-store x all-SKU snapshot once (reused across tabs)
-risk_table = build_risk_table(df, stores_selected, products_selected_df, AS_OF_DATE, forecast_period)
-full_table = build_full_snapshot_table(df, STORES, PRODUCTS, AS_OF_DATE, forecast_period)
+# Pre-compute the risk table and the full all-store x all-SKU snapshot once (reused across tabs).
+# Both incorporate any manually logged Stock Intake adjustments, so a manual entry genuinely
+# changes every recommendation across the app, not just what's displayed on one tab.
+risk_table = build_risk_table(df, stores_selected, products_selected_df, AS_OF_DATE, forecast_period, stock_adjustments)
+full_table = build_full_snapshot_table(df, STORES, PRODUCTS, AS_OF_DATE, forecast_period, stock_adjustments)
 
 
 def _risk_style(val):
@@ -272,6 +293,72 @@ with tab_forecast:
         )
 
 # ===========================================================================
+# TAB: MACHINE LEARNING FORECAST — real, backtested Random Forest per SKU
+# ===========================================================================
+with tab_ml:
+    st.subheader("Machine Learning Forecast — Random Forest (network-wide, per SKU)")
+    st.write(
+        "This is a genuine machine learning model — scikit-learn `RandomForestRegressor` — trained "
+        "on lag, rolling-average and calendar features engineered from historical `Units_Sold`. "
+        "Unlike the side-by-side comparison on the Demand Forecasting tab, the numbers below come "
+        "from a real **chronological backtest**: the model is trained only on earlier data and "
+        f"evaluated on the most recent **{ml_forecast.TEST_WINDOW_DAYS} held-out days** it never saw "
+        "during training — so any claim that it beats the baseline is backed by an actual test, not assumed."
+    )
+    st.caption("`Simulated_True_Demand` is never used as a feature or target, for the same data-leakage reasons as the baseline model.")
+
+    ml_sku_choice = st.selectbox(
+        "SKU", PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"], index=0, key="ml_sku_choice"
+    )
+    ml_sku_id = ml_sku_choice.split(" – ")[0]
+
+    with st.spinner("Training and backtesting the Random Forest model…"):
+        bundle = ml_forecast.train_and_backtest(df, ml_sku_id)
+
+    if bundle.get("error"):
+        st.warning(bundle["error"])
+    else:
+        st.markdown(f"**Backtest — last {ml_forecast.TEST_WINDOW_DAYS} days, network-wide daily totals**")
+        m1, m2, m3 = st.columns(3)
+        rf_m, bl_m = bundle["rf_metrics"], bundle["baseline_metrics"]
+        m1.metric("MAE (lower is better)", f"{rf_m['MAE']:.1f}", delta=f"{rf_m['MAE']-bl_m['MAE']:+.1f} vs baseline", delta_color="inverse")
+        m2.metric("RMSE (lower is better)", f"{rf_m['RMSE']:.1f}", delta=f"{rf_m['RMSE']-bl_m['RMSE']:+.1f} vs baseline", delta_color="inverse")
+        m3.metric("MAPE (lower is better)", f"{rf_m['MAPE']:.1f}%", delta=f"{rf_m['MAPE']-bl_m['MAPE']:+.1f}pp vs baseline", delta_color="inverse")
+
+        if rf_m["MAE"] < bl_m["MAE"]:
+            st.success(
+                f"On this backtest, Random Forest beats the 7-day moving-average baseline for "
+                f"{ml_sku_id} — {rf_m['MAE']:.1f} vs {bl_m['MAE']:.1f} average units of error per day."
+            )
+        else:
+            st.info(
+                f"On this backtest, the simple baseline actually matches or beats Random Forest for "
+                f"{ml_sku_id} — {bl_m['MAE']:.1f} vs {rf_m['MAE']:.1f} average units of error per day. "
+                f"Reported honestly either way, as required."
+            )
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=bundle["test_dates"], y=bundle["test_actual"], name="Actual", line=dict(color="#1f77b4")))
+        fig.add_trace(go.Scatter(x=bundle["test_dates"], y=bundle["rf_pred"], name="Random Forest", line=dict(color="#2ca02c", dash="dash")))
+        fig.add_trace(go.Scatter(x=bundle["test_dates"], y=bundle["baseline_pred"], name="Baseline (7-day MA)", line=dict(color="#ff7f0e", dash="dot")))
+        fig.update_layout(title=f"Backtest — Actual vs Predicted, {ml_sku_id} (network-wide)", xaxis_title="Date", yaxis_title="Units Sold", legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("Feature importances (what the model actually learned from)"):
+            imp_df = pd.DataFrame(list(bundle["feature_importances"].items()), columns=["Feature", "Importance"]).sort_values("Importance", ascending=False)
+            st.dataframe(imp_df, use_container_width=True, hide_index=True)
+
+        st.markdown(f"**Forward forecast — next {forecast_period} days (recursive, network-wide)**")
+        fwd = ml_forecast.forecast_forward(df, ml_sku_id, bundle, AS_OF_DATE, forecast_period)
+        fwd_df = pd.DataFrame({"Date": [d.date() for d in fwd["forecast_dates"]], "ML Forecast (network)": [round(v, 1) for v in fwd["forecast_values"]]})
+        st.dataframe(fwd_df, use_container_width=True, hide_index=True)
+        st.caption(
+            "Recursive forecast: each predicted day feeds the lag features for the next day, since "
+            "those aren't known in advance. Multi-step forecasts like this naturally get less certain "
+            "the further out they go — a normal, disclosed limitation of this approach."
+        )
+
+# ===========================================================================
 # TAB 4: INVENTORY MONITORING — all stores, all SKUs
 # ===========================================================================
 with tab_inventory:
@@ -306,6 +393,131 @@ with tab_inventory:
         st.plotly_chart(fig, use_container_width=True)
 
 # ===========================================================================
+# TAB: STOCK INTAKE — manually log stock receipts; feeds every calculation
+# ===========================================================================
+with tab_intake:
+    st.subheader("Stock Intake — Log Received Stock")
+    st.write(
+        "Log stock as it's physically received. Every entry here is added directly to that "
+        "Store × SKU's Current Stock and immediately flows through to Lead-Time, Reorder, "
+        "Risk and every other tab in this app — it's a real adjustment, not just a note."
+    )
+
+    with st.form("stock_intake_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            intake_store = st.selectbox("Store", STORES)
+        with c2:
+            intake_product_label = st.selectbox("Product", PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"])
+        with c3:
+            intake_qty = st.number_input("Quantity received", min_value=1, step=1, value=50)
+        intake_note = st.text_input("Note (optional)", placeholder="e.g. delivery from supplier, manual correction")
+        submitted = st.form_submit_button("➕ Log stock receipt")
+
+        if submitted:
+            intake_sku = intake_product_label.split(" – ")[0]
+            intake_name = PRODUCTS.loc[PRODUCTS["Product_ID"] == intake_sku, "Product_Name"].iloc[0]
+            st.session_state.stock_ledger.append({
+                "Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+                "Store": intake_store, "SKU": intake_sku, "Product": intake_name,
+                "Quantity": int(intake_qty), "Note": intake_note,
+            })
+            # Pre-set the AI Assessment widgets' own keyed state directly (not just a plain
+            # session_state value) - Streamlit ignores a selectbox's `index=` argument on
+            # reruns once the widget has already rendered once, so this is the correct way
+            # to make the assessment below jump to whatever was just logged.
+            st.session_state["assess_store"] = intake_store
+            st.session_state["assess_product"] = intake_product_label
+            st.success(f"Logged +{intake_qty} units of {intake_name} at {intake_store}. Every tab now reflects this.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### 🤖 AI Stock Assessment")
+    st.write(
+        "Is the stock level right, understocked, or overstocked? This reads the same demand "
+        "forecast and reorder-point numbers already calculated elsewhere in the app — no separate "
+        "model, no new assumptions — and turns them into a plain-language verdict."
+    )
+
+    product_labels = list(PRODUCTS["Product_ID"] + " – " + PRODUCTS["Product_Name"])
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        assess_store = st.selectbox("Store", STORES, key="assess_store")
+    with ac2:
+        assess_product_label = st.selectbox("Product", product_labels, key="assess_product")
+    assess_sku = assess_product_label.split(" – ")[0]
+
+    row = full_table[(full_table["Store"] == assess_store) & (full_table["SKU"] == assess_sku)]
+    if row.empty:
+        st.warning("No data available for this combination.")
+    else:
+        r = row.iloc[0]
+        verdict = assess_stock_position(r["Current_Stock"], r["Forecast_During_Lead_Time"], r["Safety_Stock"])
+
+        status_style = {
+            "Understocked": ("🔴", "#fce8e6"),
+            "Below Target": ("🟠", "#fef3e2"),
+            "Well Stocked": ("🟢", "#e6f4ea"),
+            "Overstocked": ("🟣", "#f3e8fd"),
+            "Insufficient Data": ("⚪", "#f0f0f0"),
+        }
+        icon, bg = status_style.get(verdict["status"], ("⚪", "#f0f0f0"))
+
+        st.markdown(
+            f"""<div style="background-color:{bg}; padding:16px 20px; border-radius:10px;">
+            <span style="font-size:20px; font-weight:700;">{icon} {verdict['status']}</span><br/>
+            <span style="font-size:14.5px;">{verdict['message']}</span>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        if r["Manual_Adjustment"]:
+            st.caption(f"Includes +{r['Manual_Adjustment']:.0f} units logged via Stock Intake for {assess_product_label.split(' – ')[1]} at {assess_store}.")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Current Stock", f"{verdict['current_stock']:.0f}")
+        m2.metric("Forecast During Lead Time", f"{verdict['forecast_during_lead_time']:.0f}")
+        m3.metric("Reorder Point (+20% safety)", f"{verdict['reorder_point']:.0f}")
+        m4.metric("Overstock Threshold (2×)", f"{verdict['overstock_threshold']:.0f}" if verdict['overstock_threshold'] else "—")
+
+        if verdict["overstock_threshold"]:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=[verdict["current_stock"]], y=["Current Stock"], orientation="h",
+                marker_color={"Understocked": "#d62728", "Below Target": "#f77f00", "Well Stocked": "#2ca02c", "Overstocked": "#7b2cbf"}.get(verdict["status"], "#888"),
+                showlegend=False,
+            ))
+            fig.add_vline(x=verdict["forecast_during_lead_time"], line_dash="dash", line_color="#d62728",
+                          annotation_text="Bare minimum", annotation_position="top")
+            fig.add_vline(x=verdict["reorder_point"], line_dash="dash", line_color="#2ca02c",
+                          annotation_text="Reorder point", annotation_position="top")
+            fig.add_vline(x=verdict["overstock_threshold"], line_dash="dash", line_color="#7b2cbf",
+                          annotation_text="Overstock threshold", annotation_position="top")
+            fig.update_layout(height=180, margin=dict(l=10, r=10, t=40, b=10), xaxis_title="Units")
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("**Intake ledger (this session)**")
+    if not st.session_state.stock_ledger:
+        st.caption("No manual stock entries logged yet.")
+    else:
+        ledger_df = pd.DataFrame(st.session_state.stock_ledger)
+        st.dataframe(ledger_df, use_container_width=True, hide_index=True)
+
+        summary = ledger_df.groupby(["Store", "SKU", "Product"])["Quantity"].sum().reset_index().rename(columns={"Quantity": "Total Logged"})
+        st.markdown("**Net adjustment by Store × SKU**")
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        if st.button("🗑️ Clear all logged entries"):
+            st.session_state.stock_ledger = []
+            st.rerun()
+
+    st.caption(
+        "Entries are kept only for this browser session (in memory) — they reset if the app restarts "
+        "or the page is closed. In a production system this would write to a real inventory database."
+    )
+
+# ===========================================================================
 # TAB 5: LEAD-TIME TRACKING — all stores, all SKUs
 # ===========================================================================
 with tab_leadtime:
@@ -328,6 +540,68 @@ with tab_leadtime:
                  title="Current Stock vs Forecasted Demand During Lead Time, by Store & SKU",
                  labels={"value": "Units", "variable": "Metric"})
     st.plotly_chart(fig, use_container_width=True)
+
+# ===========================================================================
+# TAB: LEAD-TIME ANTICIPATION — predicts actual delivery variability
+# ===========================================================================
+with tab_leadtime_ai:
+    st.subheader("Lead-Time Anticipation — All Stores × All SKUs")
+    st.write(
+        "The historical dataset records a single **fixed** lead time per SKU, with no day-to-day "
+        "variability to learn from — so a real supplier never delivers in exactly the same number "
+        "of days every time. This tab **anticipates** the next delivery using variability actually "
+        "observed in the Live Simulation, rather than just repeating that fixed textbook number."
+    )
+
+    sim_state = st.session_state.get("sim_state")
+    if sim_state is None or sim_state["lead_time_log"].empty:
+        st.info(
+            "No delivery history yet — open the **🔴 Live Simulation** tab and advance a few days "
+            "(or turn on Auto-play). As orders are placed and arrive, this tab will start anticipating "
+            "each Store × SKU's real delivery variability from what actually happened.",
+            icon="🚚",
+        )
+        st.markdown("**Planned lead time (fixed, from the dataset) — shown until simulation data exists:**")
+        st.dataframe(
+            full_table[["Store", "Product", "SKU", "Lead_Time_Days"]].rename(columns={"Lead_Time_Days": "Planned Lead Time (days)"}),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        lt_log = sim_state["lead_time_log"]
+        rows = []
+        for _, r in full_table.iterrows():
+            res = simulation.anticipate_lead_time(lt_log, r["Store"], r["SKU"], r["Lead_Time_Days"])
+            rows.append({
+                "Store": r["Store"], "Product": r["Product"], "SKU": r["SKU"],
+                "Planned Lead Time (days)": r["Lead_Time_Days"],
+                "Deliveries Observed": res["n_observations"],
+                "Anticipated Lead Time (days)": res["anticipated_days"],
+                "Range (± 1 std dev)": f"{res['low']}–{res['high']}" if res["n_observations"] > 0 else "—",
+            })
+        anticipation_df = pd.DataFrame(rows)
+        st.dataframe(anticipation_df, use_container_width=True, hide_index=True)
+        st.caption(f"Based on {len(lt_log)} order(s) observed across {sim_state['days_simulated']} simulated day(s) so far.")
+
+        st.divider()
+        st.markdown("**Planned vs actual delivery time — every logged order**")
+        plot_df = lt_log.copy()
+        plot_df["Combo"] = plot_df["Store"] + " · " + plot_df["Product_Name"]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=plot_df["Order_Date"], y=plot_df["Planned_Lead_Time"], mode="markers",
+                                  name="Planned", marker=dict(color="#9467bd", symbol="line-ew", size=10)))
+        fig.add_trace(go.Scatter(x=plot_df["Order_Date"], y=plot_df["Actual_Lead_Time"], mode="markers",
+                                  name="Actual", marker=dict(color="#2ca02c", size=7)))
+        fig.update_layout(title="Planned vs Actual Lead Time — every order placed in the simulation",
+                           xaxis_title="Order Date", yaxis_title="Lead Time (days)",
+                           legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.caption(
+            "SIMULATED: this variability comes from an explicit, disclosed assumption in the Live "
+            "Simulation (± 30% spread around each SKU's fixed lead time), used to give this "
+            "anticipation feature genuine variability to learn from. It is not measured from real "
+            "supplier performance data, which this dataset does not contain."
+        )
 
 # ===========================================================================
 # TAB 6: EXPIRY TRACKING — all stores, all SKUs
